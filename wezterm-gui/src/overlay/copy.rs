@@ -1617,7 +1617,7 @@ fn is_whitespace_word(word: &str) -> bool {
     }
 }
 
-fn move_forward_word_end_in_str(s: &str) -> Option<usize> {
+pub(crate) fn move_forward_word_end_in_str(s: &str) -> Option<usize> {
     let mut segments = vec![];
     let mut pos = 0;
 
@@ -1641,31 +1641,6 @@ fn move_forward_word_end_in_str(s: &str) -> Option<usize> {
     }?;
 
     Some(target.1 - 1)
-}
-
-#[cfg(test)]
-mod copy_mode_tests {
-    use super::move_forward_word_end_in_str;
-
-    #[test]
-    fn move_forward_word_end_moves_to_end_of_current_word() {
-        assert_eq!(move_forward_word_end_in_str("foo bar"), Some(2));
-    }
-
-    #[test]
-    fn move_forward_word_end_skips_leading_whitespace() {
-        assert_eq!(move_forward_word_end_in_str("   bar baz"), Some(5));
-    }
-
-    #[test]
-    fn move_forward_word_end_moves_to_next_word_when_already_at_word_end() {
-        assert_eq!(move_forward_word_end_in_str("o bar"), Some(4));
-    }
-
-    #[test]
-    fn move_forward_word_end_returns_none_when_only_whitespace_remains() {
-        assert_eq!(move_forward_word_end_in_str("   "), None);
-    }
 }
 
 pub fn search_key_table() -> KeyTable {
