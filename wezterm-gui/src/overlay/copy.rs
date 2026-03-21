@@ -918,7 +918,6 @@ impl CopyRenderable {
             self.cursor.y = top;
             let width = line.len();
             let s = line.columns_as_str(self.cursor.x..width + 1);
-            let mut words = s.split_word_bounds();
 
             if self.cursor.x >= width - 1 {
                 let dims = self.delegate.get_dimensions();
@@ -930,26 +929,16 @@ impl CopyRenderable {
                 }
             }
 
-            if let Some(word) = words.next() {
-                let mut word_end = self.cursor.x + unicode_column_width(word, None);
-                if !is_whitespace_word(word) {
-                    if self.cursor.x == word_end - 1 {
-                        while let Some(next_word) = words.next() {
-                            word_end += unicode_column_width(next_word, None);
-                            if !is_whitespace_word(next_word) {
-                                break;
-                            }
-                        }
-                    }
+            if let Some(offset) = move_forward_word_end_in_str(&s) {
+                self.cursor.x += offset;
+            } else {
+                let dims = self.delegate.get_dimensions();
+                let max_row = dims.scrollback_top + dims.scrollback_rows as isize;
+                if self.cursor.y + 1 < max_row {
+                    self.cursor.y += 1;
+                    self.cursor.x = 0;
+                    return self.move_to_end_of_word();
                 }
-                while let Some(next_word) = words.next() {
-                    if !is_whitespace_word(next_word) {
-                        word_end += unicode_column_width(next_word, None);
-                    } else {
-                        break;
-                    }
-                }
-                self.cursor.x = word_end - 1;
             }
         }
         self.select_to_cursor_pos();
@@ -1625,6 +1614,57 @@ fn is_whitespace_word(word: &str) -> bool {
         c.is_whitespace()
     } else {
         false
+    }
+}
+
+fn move_forward_word_end_in_str(s: &str) -> Option<usize> {
+    let mut segments = vec![];
+    let mut pos = 0;
+
+    for word in s.split_word_bounds() {
+        let width = unicode_column_width(word, None);
+        if width == 0 {
+            continue;
+        }
+        let end = pos + width;
+        segments.push((pos, end, is_whitespace_word(word)));
+        pos = end;
+    }
+
+    let current = segments.first().copied()?;
+    let target = if current.2 {
+        segments.into_iter().find(|(_, _, is_ws)| !is_ws)
+    } else if current.1 > 1 {
+        Some(current)
+    } else {
+        segments.into_iter().skip(1).find(|(_, _, is_ws)| !is_ws)
+    }?;
+
+    Some(target.1 - 1)
+}
+
+#[cfg(test)]
+mod copy_mode_tests {
+    use super::move_forward_word_end_in_str;
+
+    #[test]
+    fn move_forward_word_end_moves_to_end_of_current_word() {
+        assert_eq!(move_forward_word_end_in_str("foo bar"), Some(2));
+    }
+
+    #[test]
+    fn move_forward_word_end_skips_leading_whitespace() {
+        assert_eq!(move_forward_word_end_in_str("   bar baz"), Some(5));
+    }
+
+    #[test]
+    fn move_forward_word_end_moves_to_next_word_when_already_at_word_end() {
+        assert_eq!(move_forward_word_end_in_str("o bar"), Some(4));
+    }
+
+    #[test]
+    fn move_forward_word_end_returns_none_when_only_whitespace_remains() {
+        assert_eq!(move_forward_word_end_in_str("   "), None);
     }
 }
 
