@@ -57,6 +57,40 @@ struct Jump {
     target: char,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VimWordStyle {
+    Normal,
+    Big,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PendingTextObjectOperator {
+    Yank,
+    Visual,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PendingKey {
+    PrefixG,
+    TextObjectAwaitInner(PendingTextObjectOperator),
+    TextObjectAwaitWord(PendingTextObjectOperator),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum WordSegmentKind {
+    Whitespace,
+    Keyword,
+    Punctuation,
+    BigWord,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct WordSegment {
+    start: usize,
+    end: usize,
+    kind: WordSegmentKind,
+}
+
 struct CopyRenderable {
     cursor: StableCursorPosition,
     delegate: Arc<dyn Pane>,
@@ -85,6 +119,7 @@ struct CopyRenderable {
     searching: Option<Searching>,
     pending_jump: Option<PendingJump>,
     last_jump: Option<Jump>,
+    pending_key: Option<PendingKey>,
 }
 
 struct Searching {
@@ -162,6 +197,7 @@ impl CopyOverlay {
             searching: None,
             pending_jump: None,
             last_jump: None,
+            pending_key: None,
         };
 
         let search_row = render.compute_search_row();
@@ -824,124 +860,222 @@ impl CopyRenderable {
         }
     }
 
-    fn move_backward_one_word(&mut self) {
-        let y = if self.cursor.x == 0 && self.cursor.y > 0 {
-            self.cursor.x = usize::max_value();
-            self.cursor.y.saturating_sub(1)
-        } else {
-            self.cursor.y
-        };
+    fn move_backward_one_word(&mut self, style: VimWordStyle) {
+        let dims = self.delegate.get_dimensions();
+        let mut y = self.cursor.y;
+        let mut x = self.cursor.x;
 
-        let (top, lines) = self.delegate.get_lines(y..y + 1);
-        if let Some(line) = lines.get(0) {
+        loop {
+            let (top, lines) = self.delegate.get_lines(y..y + 1);
+            let Some(line) = lines.get(0) else {
+                break;
+            };
             self.cursor.y = top;
-            if self.cursor.x == usize::max_value() {
-                self.cursor.x = line.len().saturating_sub(1);
+            let width = line.len();
+            let s = line.columns_as_str(0..width.saturating_add(1));
+            let cursor = if top == self.cursor.y && y == self.cursor.y {
+                x.min(width)
+            } else {
+                width
+            };
+
+            if let Some(target) = move_backward_word_start_in_str(&s, cursor, style) {
+                self.cursor.x = target;
+                self.select_to_cursor_pos();
+                return;
             }
-            let s = line.columns_as_str(0..self.cursor.x.saturating_add(1));
 
-            // "hello there you"
-            //              |_
-            //        |    _
-            //  |    _
-            //        |     _
-            //  |     _
-
-            let mut last_was_whitespace = false;
-
-            for (idx, word) in s.split_word_bounds().rev().enumerate() {
-                let width = unicode_column_width(word, None);
-
-                if is_whitespace_word(word) {
-                    self.cursor.x = self.cursor.x.saturating_sub(width);
-                    last_was_whitespace = true;
-                    continue;
-                }
-                last_was_whitespace = false;
-
-                if idx == 0 && width == 1 {
-                    // We were at the start of the initial word
-                    self.cursor.x = self.cursor.x.saturating_sub(width);
-                    continue;
-                }
-
-                self.cursor.x = self.cursor.x.saturating_sub(width.saturating_sub(1));
+            if top <= dims.scrollback_top {
                 break;
             }
 
-            if last_was_whitespace && self.cursor.y > 0 {
-                // The line begins with whitespace
-                self.cursor.x = usize::max_value();
-                self.cursor.y -= 1;
-                return self.move_backward_one_word();
-            }
+            y = top - 1;
+            x = usize::MAX;
         }
+
         self.select_to_cursor_pos();
     }
 
-    fn move_forward_one_word(&mut self) {
-        let y = self.cursor.y;
-        let (top, lines) = self.delegate.get_lines(y..y + 1);
-        if let Some(line) = lines.get(0) {
+    fn move_forward_one_word(&mut self, style: VimWordStyle) {
+        let dims = self.delegate.get_dimensions();
+        let max_row = dims.scrollback_top + dims.scrollback_rows as isize;
+        let mut y = self.cursor.y;
+        let mut x = self.cursor.x;
+
+        loop {
+            let (top, lines) = self.delegate.get_lines(y..y + 1);
+            let Some(line) = lines.get(0) else {
+                break;
+            };
             self.cursor.y = top;
             let width = line.len();
-            let s = line.columns_as_str(self.cursor.x..width + 1);
-            let mut words = s.split_word_bounds();
+            let s = line.columns_as_str(0..width.saturating_add(1));
+            let cursor = x.min(width);
 
-            if let Some(word) = words.next() {
-                self.cursor.x += unicode_column_width(word, None);
-                if !is_whitespace_word(word) {
-                    if let Some(word) = words.next() {
-                        if is_whitespace_word(word) {
-                            self.cursor.x += unicode_column_width(word, None);
-                        }
+            if let Some(target) = move_forward_word_start_in_str(&s, cursor, style) {
+                self.cursor.x = target;
+                self.select_to_cursor_pos();
+                return;
+            }
+
+            if top + 1 >= max_row {
+                break;
+            }
+
+            y = top + 1;
+            x = 0;
+        }
+
+        self.select_to_cursor_pos();
+    }
+
+    fn move_to_end_of_word(&mut self, style: VimWordStyle) {
+        let dims = self.delegate.get_dimensions();
+        let max_row = dims.scrollback_top + dims.scrollback_rows as isize;
+        let mut y = self.cursor.y;
+        let mut x = self.cursor.x;
+
+        loop {
+            let (top, lines) = self.delegate.get_lines(y..y + 1);
+            let Some(line) = lines.get(0) else {
+                break;
+            };
+            self.cursor.y = top;
+            let width = line.len();
+            let s = line.columns_as_str(0..width.saturating_add(1));
+            let cursor = x.min(width.saturating_sub(1));
+
+            if let Some(target) = move_forward_word_end_in_str(&s, cursor, style) {
+                self.cursor.x = target;
+                self.select_to_cursor_pos();
+                return;
+            }
+
+            if top + 1 >= max_row {
+                break;
+            }
+
+            y = top + 1;
+            x = 0;
+        }
+
+        self.select_to_cursor_pos();
+    }
+
+    fn move_to_backward_word_end(&mut self, style: VimWordStyle) {
+        let dims = self.delegate.get_dimensions();
+        let mut y = self.cursor.y;
+        let mut x = self.cursor.x;
+
+        loop {
+            let (top, lines) = self.delegate.get_lines(y..y + 1);
+            let Some(line) = lines.get(0) else {
+                break;
+            };
+            self.cursor.y = top;
+            let width = line.len();
+            let s = line.columns_as_str(0..width.saturating_add(1));
+            let cursor = x.min(width);
+
+            if let Some(target) = move_backward_word_end_in_str(&s, cursor, style) {
+                self.cursor.x = target;
+                self.select_to_cursor_pos();
+                return;
+            }
+
+            if top <= dims.scrollback_top {
+                break;
+            }
+
+            y = top - 1;
+            x = usize::MAX;
+        }
+
+        self.select_to_cursor_pos();
+    }
+
+    fn inner_word_range(&self) -> SelectionRange {
+        let (top, lines) = self.delegate.get_lines(self.cursor.y..self.cursor.y + 1);
+        let Some(line) = lines.get(0) else {
+            let coord = SelectionCoordinate::x_y(self.cursor.x, self.cursor.y);
+            return SelectionRange::start(coord);
+        };
+
+        let width = line.len();
+        let s = line.columns_as_str(0..width.saturating_add(1));
+        let cursor = self.cursor.x.min(width.saturating_sub(1));
+
+        if let Some((start, end)) = inner_word_range_in_str(&s, cursor, VimWordStyle::Normal) {
+            SelectionRange {
+                start: SelectionCoordinate::x_y(start, top),
+                end: SelectionCoordinate::x_y(end, top),
+            }
+        } else {
+            let coord = SelectionCoordinate::x_y(self.cursor.x, self.cursor.y);
+            SelectionRange::start(coord)
+        }
+    }
+
+    fn select_inner_word(&mut self) {
+        let range = self.inner_word_range();
+        self.selection_mode = SelectionMode::Cell;
+        self.start.replace(range.start);
+        self.cursor.x = match range.end.x {
+            SelectionX::Cell(x) => x,
+            SelectionX::BeforeZero => 0,
+        };
+        self.cursor.y = range.end.y;
+        self.adjust_selection(range.start, range);
+    }
+
+    fn text_for_selection_range(&self, range: SelectionRange) -> String {
+        let mut s = String::new();
+        let sel = range.normalize();
+        let first_row = sel.rows().start;
+        let last_row = sel.rows().end;
+        let mut last_was_wrapped = false;
+
+        for line in self.delegate.get_logical_lines(sel.rows()) {
+            if !s.is_empty() && !last_was_wrapped {
+                s.push('\n');
+            }
+            let last_idx = line.physical_lines.len().saturating_sub(1);
+            for (idx, phys) in line.physical_lines.iter().enumerate() {
+                let this_row = line.first_row + idx as StableRowIndex;
+                if this_row >= first_row && this_row < last_row {
+                    let last_phys_idx = phys.len().saturating_sub(1);
+                    let cols = sel.cols_for_row(this_row, false);
+                    let last_col_idx = cols.end.saturating_sub(1).min(last_phys_idx);
+                    let col_span = phys.columns_as_str(cols);
+                    if idx == last_idx {
+                        s.push_str(col_span.trim_end());
+                    } else {
+                        s.push_str(&col_span);
                     }
-                }
-            }
 
-            if self.cursor.x >= width {
-                let dims = self.delegate.get_dimensions();
-                let max_row = dims.scrollback_top + dims.scrollback_rows as isize;
-                if self.cursor.y + 1 < max_row {
-                    self.cursor.y += 1;
-                    return self.move_to_start_of_line_content();
+                    last_was_wrapped = last_col_idx == last_phys_idx
+                        && phys
+                            .get_cell(last_col_idx)
+                            .map(|c| c.attrs().wrapped())
+                            .unwrap_or(false);
                 }
             }
         }
-        self.select_to_cursor_pos();
+
+        s
     }
 
-    fn move_to_end_of_word(&mut self) {
-        let y = self.cursor.y;
-        let (top, lines) = self.delegate.get_lines(y..y + 1);
-        if let Some(line) = lines.get(0) {
-            self.cursor.y = top;
-            let width = line.len();
-            let s = line.columns_as_str(self.cursor.x..width + 1);
-
-            if self.cursor.x >= width - 1 {
-                let dims = self.delegate.get_dimensions();
-                let max_row = dims.scrollback_top + dims.scrollback_rows as isize;
-                if self.cursor.y + 1 < max_row {
-                    self.cursor.y += 1;
-                    self.cursor.x = 0;
-                    return self.move_to_end_of_word();
-                }
-            }
-
-            if let Some(offset) = move_forward_word_end_in_str(&s) {
-                self.cursor.x += offset;
-            } else {
-                let dims = self.delegate.get_dimensions();
-                let max_row = dims.scrollback_top + dims.scrollback_rows as isize;
-                if self.cursor.y + 1 < max_row {
-                    self.cursor.y += 1;
-                    self.cursor.x = 0;
-                    return self.move_to_end_of_word();
-                }
-            }
-        }
-        self.select_to_cursor_pos();
+    fn copy_inner_word_and_close(&mut self) {
+        let text = self.text_for_selection_range(self.inner_word_range());
+        let window = self.window.clone();
+        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+            term_window.copy_to_clipboard(
+                ClipboardCopyDestination::ClipboardAndPrimarySelection,
+                text.clone(),
+            );
+        })));
+        self.set_viewport(None);
+        self.close();
     }
 
     fn move_by_zone(&mut self, mut delta: isize, zone_type: Option<SemanticType>) {
@@ -1089,6 +1223,77 @@ impl CopyRenderable {
         self.start.take();
         self.clear_selection();
     }
+
+    fn begin_prefix_g(&mut self) {
+        self.pending_key.replace(PendingKey::PrefixG);
+    }
+
+    fn begin_text_object_selection(&mut self) {
+        self.pending_key.replace(PendingKey::TextObjectAwaitInner(
+            PendingTextObjectOperator::Visual,
+        ));
+        self.set_selection_mode(&Some(SelectionMode::Cell));
+    }
+
+    fn begin_text_object_yank(&mut self) {
+        if self.start.is_some() {
+            let pane = Arc::clone(&self.delegate);
+            let window = self.window.clone();
+            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                term_window.copy_to_clipboard(
+                    ClipboardCopyDestination::ClipboardAndPrimarySelection,
+                    term_window.selection_text(&pane),
+                );
+            })));
+            self.set_viewport(None);
+            self.close();
+            return;
+        }
+        self.pending_key.replace(PendingKey::TextObjectAwaitInner(
+            PendingTextObjectOperator::Yank,
+        ));
+    }
+
+    fn clear_pending_key(&mut self) {
+        self.pending_key.take();
+    }
+
+    fn resolve_pending_assignment(&mut self, assignment: &CopyModeAssignment) -> bool {
+        match self.pending_key {
+            Some(PendingKey::PrefixG) => {
+                self.pending_key.take();
+                match assignment {
+                    CopyModeAssignment::BeginVimPrefixG => {
+                        self.move_to_top();
+                        true
+                    }
+                    CopyModeAssignment::MoveForwardWordEnd => {
+                        self.move_to_backward_word_end(VimWordStyle::Normal);
+                        true
+                    }
+                    CopyModeAssignment::MoveForwardBigWordEnd => {
+                        self.move_to_backward_word_end(VimWordStyle::Big);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Some(PendingKey::TextObjectAwaitWord(operator)) => {
+                self.pending_key.take();
+                match assignment {
+                    CopyModeAssignment::MoveForwardWord => {
+                        match operator {
+                            PendingTextObjectOperator::Yank => self.copy_inner_word_and_close(),
+                            PendingTextObjectOperator::Visual => self.select_inner_word(),
+                        }
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            Some(PendingKey::TextObjectAwaitInner(_)) | None => false,
+        }
+    }
 }
 
 impl Pane for CopyOverlay {
@@ -1150,6 +1355,28 @@ impl Pane for CopyOverlay {
                 }
             }
             return Ok(());
+        }
+
+        if let Some(pending) = render.pending_key {
+            if let PendingKey::TextObjectAwaitInner(operator) = pending {
+                match (key, mods) {
+                    (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                        render
+                            .pending_key
+                            .replace(PendingKey::TextObjectAwaitWord(operator));
+                        return Ok(());
+                    }
+                    _ => render.clear_pending_key(),
+                }
+            } else if matches!(pending, PendingKey::PrefixG) {
+                match (key, mods) {
+                    (KeyCode::Char('e'), KeyModifiers::NONE)
+                    | (KeyCode::Char('E'), KeyModifiers::NONE)
+                    | (KeyCode::Char('E'), KeyModifiers::SHIFT)
+                    | (KeyCode::Char('g'), KeyModifiers::NONE) => {}
+                    _ => render.clear_pending_key(),
+                }
+            }
         }
 
         if render.editing_search {
@@ -1239,6 +1466,12 @@ impl Pane for CopyOverlay {
         }
         match assignment {
             KeyAssignment::CopyMode(assignment) => {
+                if render.resolve_pending_assignment(assignment) {
+                    return PerformAssignmentResult::Handled;
+                }
+                if render.pending_key.is_some() {
+                    render.clear_pending_key();
+                }
                 match assignment {
                     MoveToViewportBottom => render.move_to_viewport_bottom(),
                     MoveToViewportTop => render.move_to_viewport_top(),
@@ -1251,9 +1484,13 @@ impl Pane for CopyOverlay {
                     MoveToStartOfNextLine => render.move_to_start_of_next_line(),
                     MoveToSelectionOtherEnd => render.move_to_selection_other_end(),
                     MoveToSelectionOtherEndHoriz => render.move_to_selection_other_end_horiz(),
-                    MoveBackwardWord => render.move_backward_one_word(),
-                    MoveForwardWord => render.move_forward_one_word(),
-                    MoveForwardWordEnd => render.move_to_end_of_word(),
+                    MoveBackwardWord => render.move_backward_one_word(VimWordStyle::Normal),
+                    MoveBackwardWordEnd => render.move_to_backward_word_end(VimWordStyle::Normal),
+                    MoveBackwardBigWord => render.move_backward_one_word(VimWordStyle::Big),
+                    MoveForwardWord => render.move_forward_one_word(VimWordStyle::Normal),
+                    MoveForwardBigWord => render.move_forward_one_word(VimWordStyle::Big),
+                    MoveForwardWordEnd => render.move_to_end_of_word(VimWordStyle::Normal),
+                    MoveForwardBigWordEnd => render.move_to_end_of_word(VimWordStyle::Big),
                     MoveRight => render.move_right_single_cell(),
                     MoveLeft => render.move_left_single_cell(),
                     MoveUp => render.move_up_single_row(),
@@ -1280,6 +1517,9 @@ impl Pane for CopyOverlay {
                     JumpBackward { prev_char } => render.jump(false, *prev_char),
                     JumpAgain => render.jump_again(false),
                     JumpReverse => render.jump_again(true),
+                    BeginVimPrefixG => render.begin_prefix_g(),
+                    BeginTextObjectYank => render.begin_text_object_yank(),
+                    BeginTextObjectSelection => render.begin_text_object_selection(),
                 }
                 PerformAssignmentResult::Handled
             }
@@ -1609,38 +1849,170 @@ impl std::io::Write for SearchOverlayPatternWriter {
     }
 }
 
-fn is_whitespace_word(word: &str) -> bool {
-    if let Some(c) = word.chars().next() {
-        c.is_whitespace()
-    } else {
-        false
+fn small_word_kind(s: &str) -> WordSegmentKind {
+    match s.chars().next() {
+        Some(c) if c.is_whitespace() => WordSegmentKind::Whitespace,
+        Some(c) if c.is_alphanumeric() || c == '_' => WordSegmentKind::Keyword,
+        Some(_) => WordSegmentKind::Punctuation,
+        None => WordSegmentKind::Whitespace,
     }
 }
 
-pub(crate) fn move_forward_word_end_in_str(s: &str) -> Option<usize> {
-    let mut segments = vec![];
+fn word_segments_in_str(s: &str, style: VimWordStyle) -> Vec<WordSegment> {
+    let mut segments: Vec<WordSegment> = Vec::new();
     let mut pos = 0;
 
-    for word in s.split_word_bounds() {
-        let width = unicode_column_width(word, None);
+    for grapheme in s.graphemes(true) {
+        let width = unicode_column_width(grapheme, None);
         if width == 0 {
             continue;
         }
+
+        let kind = match style {
+            VimWordStyle::Big => {
+                if grapheme
+                    .chars()
+                    .next()
+                    .map(|c| c.is_whitespace())
+                    .unwrap_or(false)
+                {
+                    WordSegmentKind::Whitespace
+                } else {
+                    WordSegmentKind::BigWord
+                }
+            }
+            VimWordStyle::Normal => small_word_kind(grapheme),
+        };
+
         let end = pos + width;
-        segments.push((pos, end, is_whitespace_word(word)));
+        if let Some(last) = segments.last_mut() {
+            if last.kind == kind {
+                last.end = end;
+            } else {
+                segments.push(WordSegment {
+                    start: pos,
+                    end,
+                    kind,
+                });
+            }
+        } else {
+            segments.push(WordSegment {
+                start: pos,
+                end,
+                kind,
+            });
+        }
         pos = end;
     }
 
-    let current = segments.first().copied()?;
-    let target = if current.2 {
-        segments.into_iter().find(|(_, _, is_ws)| !is_ws)
-    } else if current.1 > 1 {
-        Some(current)
-    } else {
-        segments.into_iter().skip(1).find(|(_, _, is_ws)| !is_ws)
-    }?;
+    segments
+}
 
-    Some(target.1 - 1)
+fn segment_containing(segments: &[WordSegment], cursor: usize) -> Option<usize> {
+    segments
+        .iter()
+        .position(|seg| cursor >= seg.start && cursor < seg.end)
+}
+
+fn move_forward_word_start_in_str(s: &str, cursor: usize, style: VimWordStyle) -> Option<usize> {
+    let segments = word_segments_in_str(s, style);
+    if let Some(idx) = segment_containing(&segments, cursor) {
+        return segments
+            .iter()
+            .skip(idx + 1)
+            .find(|seg| seg.kind != WordSegmentKind::Whitespace)
+            .map(|seg| seg.start);
+    }
+
+    segments
+        .iter()
+        .find(|seg| seg.start > cursor && seg.kind != WordSegmentKind::Whitespace)
+        .map(|seg| seg.start)
+}
+
+fn move_backward_word_start_in_str(s: &str, cursor: usize, style: VimWordStyle) -> Option<usize> {
+    let segments = word_segments_in_str(s, style);
+    let idx = segment_containing(&segments, cursor).or_else(|| {
+        segments
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, seg)| seg.end <= cursor)
+            .map(|(idx, _)| idx)
+    })?;
+
+    let current = segments[idx];
+    if current.kind != WordSegmentKind::Whitespace && cursor > current.start {
+        return Some(current.start);
+    }
+
+    segments[..idx]
+        .iter()
+        .rev()
+        .find(|seg| seg.kind != WordSegmentKind::Whitespace)
+        .map(|seg| seg.start)
+}
+
+fn inner_word_range_in_str(
+    s: &str,
+    cursor: usize,
+    style: VimWordStyle,
+) -> Option<(usize, usize)> {
+    let segments = word_segments_in_str(s, style);
+    let idx = segment_containing(&segments, cursor).or_else(|| {
+        segments
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, seg)| seg.end <= cursor)
+            .map(|(idx, _)| idx)
+    })?;
+
+    let current = segments[idx];
+    if current.kind == WordSegmentKind::Whitespace {
+        return None;
+    }
+
+    Some((current.start, current.end.saturating_sub(1)))
+}
+
+fn move_forward_word_end_in_str(s: &str, cursor: usize, style: VimWordStyle) -> Option<usize> {
+    let segments = word_segments_in_str(s, style);
+    if let Some(idx) = segment_containing(&segments, cursor) {
+        let current = segments[idx];
+
+        if current.kind != WordSegmentKind::Whitespace && cursor < current.end.saturating_sub(1) {
+            return Some(current.end - 1);
+        }
+
+        return segments
+            .iter()
+            .skip(idx + 1)
+            .find(|seg| seg.kind != WordSegmentKind::Whitespace)
+            .map(|seg| seg.end - 1);
+    }
+
+    segments
+        .iter()
+        .find(|seg| seg.start > cursor && seg.kind != WordSegmentKind::Whitespace)
+        .map(|seg| seg.end - 1)
+}
+
+fn move_backward_word_end_in_str(s: &str, cursor: usize, style: VimWordStyle) -> Option<usize> {
+    let segments = word_segments_in_str(s, style);
+    if let Some(idx) = segment_containing(&segments, cursor) {
+        return segments[..idx]
+            .iter()
+            .rev()
+            .find(|seg| seg.kind != WordSegmentKind::Whitespace)
+            .map(|seg| seg.end - 1);
+    }
+
+    segments
+        .iter()
+        .rev()
+        .find(|seg| seg.end <= cursor && seg.kind != WordSegmentKind::Whitespace)
+        .map(|seg| seg.end - 1)
 }
 
 pub fn search_key_table() -> KeyTable {
@@ -1793,9 +2165,29 @@ pub fn copy_key_table() -> KeyTable {
             KeyAssignment::CopyMode(CopyModeAssignment::MoveForwardWord),
         ),
         (
+            WKeyCode::Char('W'),
+            Modifiers::NONE,
+            KeyAssignment::CopyMode(CopyModeAssignment::MoveForwardBigWord),
+        ),
+        (
+            WKeyCode::Char('w'),
+            Modifiers::SHIFT,
+            KeyAssignment::CopyMode(CopyModeAssignment::MoveForwardBigWord),
+        ),
+        (
             WKeyCode::Char('e'),
             Modifiers::NONE,
             KeyAssignment::CopyMode(CopyModeAssignment::MoveForwardWordEnd),
+        ),
+        (
+            WKeyCode::Char('E'),
+            Modifiers::NONE,
+            KeyAssignment::CopyMode(CopyModeAssignment::MoveForwardBigWordEnd),
+        ),
+        (
+            WKeyCode::Char('e'),
+            Modifiers::SHIFT,
+            KeyAssignment::CopyMode(CopyModeAssignment::MoveForwardBigWordEnd),
         ),
         (
             WKeyCode::LeftArrow,
@@ -1816,6 +2208,16 @@ pub fn copy_key_table() -> KeyTable {
             WKeyCode::Char('b'),
             Modifiers::NONE,
             KeyAssignment::CopyMode(CopyModeAssignment::MoveBackwardWord),
+        ),
+        (
+            WKeyCode::Char('B'),
+            Modifiers::NONE,
+            KeyAssignment::CopyMode(CopyModeAssignment::MoveBackwardBigWord),
+        ),
+        (
+            WKeyCode::Char('b'),
+            Modifiers::SHIFT,
+            KeyAssignment::CopyMode(CopyModeAssignment::MoveBackwardBigWord),
         ),
         (
             WKeyCode::Char('0'),
@@ -1862,9 +2264,7 @@ pub fn copy_key_table() -> KeyTable {
         (
             WKeyCode::Char('v'),
             Modifiers::NONE,
-            KeyAssignment::CopyMode(CopyModeAssignment::SetSelectionMode(Some(
-                SelectionMode::Cell,
-            ))),
+            KeyAssignment::CopyMode(CopyModeAssignment::BeginTextObjectSelection),
         ),
         (
             WKeyCode::Char('V'),
@@ -1900,7 +2300,7 @@ pub fn copy_key_table() -> KeyTable {
         (
             WKeyCode::Char('g'),
             Modifiers::NONE,
-            KeyAssignment::CopyMode(CopyModeAssignment::MoveToScrollbackTop),
+            KeyAssignment::CopyMode(CopyModeAssignment::BeginVimPrefixG),
         ),
         (
             WKeyCode::Char('H'),
@@ -1980,10 +2380,7 @@ pub fn copy_key_table() -> KeyTable {
         (
             WKeyCode::Char('y'),
             Modifiers::NONE,
-            KeyAssignment::Multiple(vec![
-                KeyAssignment::CopyTo(ClipboardCopyDestination::ClipboardAndPrimarySelection),
-                scroll_to_bottom_and_close(),
-            ]),
+            KeyAssignment::CopyMode(CopyModeAssignment::BeginTextObjectYank),
         ),
         (
             WKeyCode::Char(';'),
@@ -2039,4 +2436,9 @@ pub fn copy_key_table() -> KeyTable {
         table.insert((key, mods), KeyTableEntry { action });
     }
     table
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 }
