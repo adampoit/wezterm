@@ -1122,8 +1122,7 @@ impl CopyRenderable {
         s
     }
 
-    fn copy_inner_word_and_close(&mut self) {
-        let text = self.text_for_selection_range(self.inner_word_range());
+    fn copy_text_and_close(&self, text: String) {
         let window = self.window.clone();
         window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
             term_window.copy_to_clipboard(
@@ -1133,6 +1132,33 @@ impl CopyRenderable {
         })));
         self.set_viewport(None);
         self.close();
+    }
+
+    fn copy_selection_and_close(&self) {
+        let pane = Arc::clone(&self.delegate);
+        let window = self.window.clone();
+        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+            term_window.copy_to_clipboard(
+                ClipboardCopyDestination::ClipboardAndPrimarySelection,
+                term_window.selection_text(&pane),
+            );
+        })));
+        self.set_viewport(None);
+        self.close();
+    }
+
+    fn copy_inner_word_and_close(&mut self) {
+        let text = self.text_for_selection_range(self.inner_word_range());
+        self.copy_text_and_close(text);
+    }
+
+    fn copy_line_and_close(&mut self) {
+        let coord = SelectionCoordinate::x_y(self.cursor.x, self.cursor.y);
+        let range = SelectionRange::line_around(coord, &*self.delegate);
+        self.start.replace(range.start);
+        self.selection_mode = SelectionMode::Line;
+        self.adjust_selection(range.start, range);
+        self.copy_selection_and_close();
     }
 
     fn move_by_zone(&mut self, mut delta: isize, zone_type: Option<SemanticType>) {
@@ -1294,16 +1320,7 @@ impl CopyRenderable {
 
     fn begin_text_object_yank(&mut self) {
         if self.start.is_some() {
-            let pane = Arc::clone(&self.delegate);
-            let window = self.window.clone();
-            window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                term_window.copy_to_clipboard(
-                    ClipboardCopyDestination::ClipboardAndPrimarySelection,
-                    term_window.selection_text(&pane),
-                );
-            })));
-            self.set_viewport(None);
-            self.close();
+            self.copy_selection_and_close();
             return;
         }
         self.pending_key.replace(PendingKey::TextObjectAwaitInner(
@@ -1368,7 +1385,19 @@ impl CopyRenderable {
                     _ => false,
                 }
             }
-            Some(PendingKey::TextObjectAwaitInner(_)) | None => false,
+            Some(PendingKey::TextObjectAwaitInner(operator)) => {
+                self.pending_key.take();
+                match assignment {
+                    CopyModeAssignment::BeginTextObjectYank
+                        if operator == PendingTextObjectOperator::Yank =>
+                    {
+                        self.copy_line_and_close();
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            None => false,
         }
     }
 }
