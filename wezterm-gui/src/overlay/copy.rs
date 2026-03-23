@@ -117,6 +117,7 @@ struct CopyRenderable {
     /// Used to debounce queries while the user is typing
     typing_cookie: usize,
     searching: Option<Searching>,
+    pending_count: Option<usize>,
     pending_jump: Option<PendingJump>,
     last_jump: Option<Jump>,
     pending_key: Option<PendingKey>,
@@ -124,6 +125,60 @@ struct CopyRenderable {
 
 struct Searching {
     remain: StableRowIndex,
+}
+
+fn push_count_digit(pending_count: &mut Option<usize>, digit: usize) {
+    let count = pending_count.unwrap_or(0);
+    *pending_count = Some(count.saturating_mul(10).saturating_add(digit));
+}
+
+fn take_count(pending_count: &mut Option<usize>) -> usize {
+    pending_count.take().unwrap_or(1)
+}
+
+fn key_down_consumes_count(
+    editing_search: bool,
+    pending_count: &mut Option<usize>,
+    key: KeyCode,
+    mods: KeyModifiers,
+) -> bool {
+    if editing_search {
+        return false;
+    }
+
+    match (key, mods) {
+        (KeyCode::Char(c @ '1'..='9'), KeyModifiers::NONE) => {
+            push_count_digit(pending_count, (c as u8 - b'0') as usize);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn assignment_uses_count(
+    pending_count: &mut Option<usize>,
+    assignment: &CopyModeAssignment,
+) -> Option<usize> {
+    match assignment {
+        CopyModeAssignment::MoveToStartOfLine if pending_count.is_some() => {
+            push_count_digit(pending_count, 0);
+            Some(0)
+        }
+        CopyModeAssignment::MoveUp | CopyModeAssignment::MoveDown => Some(take_count(pending_count)),
+        _ => None,
+    }
+}
+
+fn should_clear_pending_count_for_assignment(
+    has_pending_count: bool,
+    assignment: &CopyModeAssignment,
+) -> bool {
+    !matches!(
+        assignment,
+        CopyModeAssignment::MoveUp
+            | CopyModeAssignment::MoveDown
+            | CopyModeAssignment::MoveToStartOfLine if has_pending_count
+    )
 }
 
 #[derive(Debug)]
@@ -195,6 +250,7 @@ impl CopyOverlay {
             selection_mode: SelectionMode::Cell,
             typing_cookie: 0,
             searching: None,
+            pending_count: None,
             pending_jump: None,
             last_jump: None,
             pending_key: None,
@@ -767,15 +823,16 @@ impl CopyRenderable {
         self.select_to_cursor_pos();
     }
 
-    fn move_up_single_row(&mut self) {
-        self.cursor.y = self.cursor.y.saturating_sub(1);
+    fn move_up_rows(&mut self, rows: usize) {
+        self.cursor.y = self.cursor.y.saturating_sub(rows as StableRowIndex);
         self.select_to_cursor_pos();
     }
 
-    fn move_down_single_row(&mut self) {
-        self.cursor.y += 1;
+    fn move_down_rows(&mut self, rows: usize) {
+        self.cursor.y += rows as StableRowIndex;
         self.select_to_cursor_pos();
     }
+
     fn move_to_start_of_line(&mut self) {
         self.cursor.x = 0;
         self.select_to_cursor_pos();
@@ -1258,6 +1315,26 @@ impl CopyRenderable {
         self.pending_key.take();
     }
 
+    fn has_pending_count(&self) -> bool {
+        self.pending_count.is_some()
+    }
+
+    fn clear_pending_count(&mut self) {
+        self.pending_count.take();
+    }
+
+    fn key_down_consumes_count(&mut self, key: KeyCode, mods: KeyModifiers) -> bool {
+        key_down_consumes_count(self.editing_search, &mut self.pending_count, key, mods)
+    }
+
+    fn assignment_uses_count(&mut self, assignment: &CopyModeAssignment) -> Option<usize> {
+        assignment_uses_count(&mut self.pending_count, assignment)
+    }
+
+    fn should_clear_pending_count_for_assignment(&self, assignment: &CopyModeAssignment) -> bool {
+        should_clear_pending_count_for_assignment(self.has_pending_count(), assignment)
+    }
+
     fn resolve_pending_assignment(&mut self, assignment: &CopyModeAssignment) -> bool {
         match self.pending_key {
             Some(PendingKey::PrefixG) => {
@@ -1357,6 +1434,10 @@ impl Pane for CopyOverlay {
             return Ok(());
         }
 
+        if render.key_down_consumes_count(key, mods) {
+            return Ok(());
+        }
+
         if let Some(pending) = render.pending_key {
             if let PendingKey::TextObjectAwaitInner(operator) = pending {
                 match (key, mods) {
@@ -1453,6 +1534,10 @@ impl Pane for CopyOverlay {
             }
         }
 
+        if render.has_pending_count() {
+            render.clear_pending_count();
+        }
+
         Ok(())
     }
 
@@ -1472,6 +1557,9 @@ impl Pane for CopyOverlay {
                 if render.pending_key.is_some() {
                     render.clear_pending_key();
                 }
+                if render.should_clear_pending_count_for_assignment(assignment) {
+                    render.clear_pending_count();
+                }
                 match assignment {
                     MoveToViewportBottom => render.move_to_viewport_bottom(),
                     MoveToViewportTop => render.move_to_viewport_top(),
@@ -1480,6 +1568,7 @@ impl Pane for CopyOverlay {
                     MoveToScrollbackBottom => render.move_to_bottom(),
                     MoveToStartOfLineContent => render.move_to_start_of_line_content(),
                     MoveToEndOfLineContent => render.move_to_end_of_line_content(),
+                    MoveToStartOfLine if render.assignment_uses_count(assignment) == Some(0) => {}
                     MoveToStartOfLine => render.move_to_start_of_line(),
                     MoveToStartOfNextLine => render.move_to_start_of_next_line(),
                     MoveToSelectionOtherEnd => render.move_to_selection_other_end(),
@@ -1493,8 +1582,14 @@ impl Pane for CopyOverlay {
                     MoveForwardBigWordEnd => render.move_to_end_of_word(VimWordStyle::Big),
                     MoveRight => render.move_right_single_cell(),
                     MoveLeft => render.move_left_single_cell(),
-                    MoveUp => render.move_up_single_row(),
-                    MoveDown => render.move_down_single_row(),
+                    MoveUp => {
+                        let count = render.assignment_uses_count(assignment).unwrap_or(1);
+                        render.move_up_rows(count);
+                    }
+                    MoveDown => {
+                        let count = render.assignment_uses_count(assignment).unwrap_or(1);
+                        render.move_down_rows(count);
+                    }
                     MoveByPage(n) => render.move_by_page(**n),
                     PageUp => render.move_by_page(-1.0),
                     PageDown => render.move_by_page(1.0),
@@ -2440,5 +2535,4 @@ pub fn copy_key_table() -> KeyTable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 }
