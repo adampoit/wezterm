@@ -526,11 +526,10 @@ impl CopyRenderable {
         let result = self.results[n].clone();
         self.cursor.y = result.end_y;
         self.cursor.x = result.end_x.saturating_sub(1);
-
-        let start = SelectionCoordinate::x_y(result.start_x, result.start_y);
-        let end = SelectionCoordinate::x_y(result.end_x.saturating_sub(1), result.end_y);
-        self.start.replace(start);
-        self.adjust_selection(start, SelectionRange { start, end });
+        self.start = None;
+        self.clear_selection();
+        self.adjust_viewport_for_cursor_position();
+        self.window.invalidate();
     }
 
     fn clamp_cursor_to_scrollback(&mut self) {
@@ -1709,7 +1708,11 @@ impl Pane for CopyOverlay {
                 visibility: termwiz::surface::CursorVisibility::Visible,
             }
         } else {
-            renderer.cursor
+            let dims = self.delegate.get_dimensions();
+            let gutter_width = line_number_gutter_width(dims.viewport_rows);
+            let mut cursor = renderer.cursor;
+            cursor.x += gutter_width;
+            cursor
         }
     }
 
@@ -1750,11 +1753,16 @@ impl Pane for CopyOverlay {
         let dims = self.get_dimensions();
         let search_row = renderer.compute_search_row();
 
+        let cursor_y = renderer.cursor.y;
+        let gutter_width = line_number_gutter_width(dims.viewport_rows);
+
         struct OverlayLines<'a> {
             with_lines: &'a mut dyn WithPaneLines,
             dims: RenderableDimensions,
             search_row: StableRowIndex,
             renderer: &'a mut CopyRenderable,
+            cursor_y: StableRowIndex,
+            gutter_width: usize,
         }
 
         self.delegate.with_lines_mut(
@@ -1764,6 +1772,8 @@ impl Pane for CopyOverlay {
                 dims,
                 search_row,
                 renderer: &mut *renderer,
+                cursor_y,
+                gutter_width,
             },
         );
 
@@ -1815,43 +1825,57 @@ impl Pane for CopyOverlay {
                         line.clear_appdata();
                     } else if let Some(matches) = self.renderer.by_line.get(&stable_idx) {
                         for m in matches {
-                            // highlight
+                            if Some(m.result_index) != self.renderer.result_pos {
+                                continue;
+                            }
                             for cell_idx in m.range.clone() {
                                 if let Some(cell) =
                                     line.cells_mut_for_attr_changes_only().get_mut(cell_idx)
                                 {
-                                    if Some(m.result_index) == self.renderer.result_pos {
-                                        cell.attrs_mut()
-                                            .set_background(
-                                                colors
-                                                    .copy_mode_active_highlight_bg
-                                                    .unwrap_or(AnsiColor::Yellow.into()),
-                                            )
-                                            .set_foreground(
-                                                colors
-                                                    .copy_mode_active_highlight_fg
-                                                    .unwrap_or(AnsiColor::Black.into()),
-                                            )
-                                            .set_reverse(false);
-                                    } else {
-                                        cell.attrs_mut()
-                                            .set_background(
-                                                colors
-                                                    .copy_mode_inactive_highlight_bg
-                                                    .unwrap_or(AnsiColor::Fuchsia.into()),
-                                            )
-                                            .set_foreground(
-                                                colors
-                                                    .copy_mode_inactive_highlight_fg
-                                                    .unwrap_or(AnsiColor::Black.into()),
-                                            )
-                                            .set_reverse(false);
-                                    }
+                                    cell.attrs_mut()
+                                        .set_background(
+                                            colors
+                                                .copy_mode_active_highlight_bg
+                                                .unwrap_or(AnsiColor::Yellow.into()),
+                                        )
+                                        .set_foreground(
+                                            colors
+                                                .copy_mode_active_highlight_fg
+                                                .unwrap_or(AnsiColor::Black.into()),
+                                        )
+                                        .set_reverse(false);
                                 }
                             }
                         }
                         line.clear_appdata();
                     }
+
+                    if stable_idx != self.search_row {
+                        // Shift existing content right to make room for the gutter
+                        for _ in 0..self.gutter_width {
+                            line.insert_cell(
+                                0,
+                                Cell::blank(),
+                                self.dims.cols,
+                                SEQ_ZERO,
+                            );
+                        }
+                        // Render the relative line number into the gutter
+                        let rel: isize = stable_idx - self.cursor_y;
+                        let label = line_number_label(rel, self.gutter_width);
+                        let num_attr = if rel == 0 {
+                            CellAttributes::default().set_reverse(true).clone()
+                        } else {
+                            CellAttributes::default()
+                                .set_foreground(AnsiColor::Silver)
+                                .clone()
+                        };
+                        line.overlay_text_with_attribute(0, &label, num_attr, SEQ_ZERO);
+                        // Force a new shape_hash so the line_quad_cache doesn't serve
+                        // the pre-gutter cached render
+                        line.clear_appdata();
+                    }
+
                     overlay_lines.push(line);
                 }
 
@@ -1908,37 +1932,24 @@ impl Pane for CopyOverlay {
                 renderer.last_bar_pos = Some(search_row);
             } else if let Some(matches) = renderer.by_line.get(&stable_idx) {
                 for m in matches {
-                    // highlight
+                    if Some(m.result_index) != renderer.result_pos {
+                        continue;
+                    }
                     for cell_idx in m.range.clone() {
                         if let Some(cell) = line.cells_mut_for_attr_changes_only().get_mut(cell_idx)
                         {
-                            if Some(m.result_index) == renderer.result_pos {
-                                cell.attrs_mut()
-                                    .set_background(
-                                        colors
-                                            .copy_mode_active_highlight_bg
-                                            .unwrap_or(AnsiColor::Yellow.into()),
-                                    )
-                                    .set_foreground(
-                                        colors
-                                            .copy_mode_active_highlight_fg
-                                            .unwrap_or(AnsiColor::Black.into()),
-                                    )
-                                    .set_reverse(false);
-                            } else {
-                                cell.attrs_mut()
-                                    .set_background(
-                                        colors
-                                            .copy_mode_inactive_highlight_bg
-                                            .unwrap_or(AnsiColor::Fuchsia.into()),
-                                    )
-                                    .set_foreground(
-                                        colors
-                                            .copy_mode_inactive_highlight_fg
-                                            .unwrap_or(AnsiColor::Black.into()),
-                                    )
-                                    .set_reverse(false);
-                            }
+                            cell.attrs_mut()
+                                .set_background(
+                                    colors
+                                        .copy_mode_active_highlight_bg
+                                        .unwrap_or(AnsiColor::Yellow.into()),
+                                )
+                                .set_foreground(
+                                    colors
+                                        .copy_mode_active_highlight_fg
+                                        .unwrap_or(AnsiColor::Black.into()),
+                                )
+                                .set_reverse(false);
                         }
                     }
                 }
@@ -1951,6 +1962,15 @@ impl Pane for CopyOverlay {
     fn get_dimensions(&self) -> RenderableDimensions {
         self.delegate.get_dimensions()
     }
+}
+
+fn line_number_gutter_width(viewport_rows: usize) -> usize {
+    format!("{}", viewport_rows).len() + 1
+}
+
+fn line_number_label(rel: isize, gutter_width: usize) -> String {
+    let num_digits = gutter_width - 1;
+    format!("{:>width$} ", rel.abs(), width = num_digits)
 }
 
 pub struct SearchOverlayPatternWriter {
@@ -2155,10 +2175,15 @@ pub fn search_key_table() -> KeyTable {
         (
             WKeyCode::Char('\r'),
             Modifiers::NONE,
-            KeyAssignment::CopyMode(CopyModeAssignment::PriorMatch),
+            KeyAssignment::CopyMode(CopyModeAssignment::AcceptPattern),
         ),
         (
             WKeyCode::Char('p'),
+            Modifiers::CTRL,
+            KeyAssignment::CopyMode(CopyModeAssignment::PriorMatch),
+        ),
+        (
+            WKeyCode::Char('\x10'),
             Modifiers::CTRL,
             KeyAssignment::CopyMode(CopyModeAssignment::PriorMatch),
         ),
@@ -2174,6 +2199,11 @@ pub fn search_key_table() -> KeyTable {
         ),
         (
             WKeyCode::Char('n'),
+            Modifiers::CTRL,
+            KeyAssignment::CopyMode(CopyModeAssignment::NextMatch),
+        ),
+        (
+            WKeyCode::Char('\x0e'),
             Modifiers::CTRL,
             KeyAssignment::CopyMode(CopyModeAssignment::NextMatch),
         ),
@@ -2556,6 +2586,26 @@ pub fn copy_key_table() -> KeyTable {
             Modifiers::NONE,
             KeyAssignment::CopyMode(CopyModeAssignment::MoveToEndOfLineContent),
         ),
+        (
+            WKeyCode::Char('/'),
+            Modifiers::NONE,
+            KeyAssignment::CopyMode(CopyModeAssignment::EditPattern),
+        ),
+        (
+            WKeyCode::Char('n'),
+            Modifiers::NONE,
+            KeyAssignment::CopyMode(CopyModeAssignment::NextMatch),
+        ),
+        (
+            WKeyCode::Char('N'),
+            Modifiers::NONE,
+            KeyAssignment::CopyMode(CopyModeAssignment::PriorMatch),
+        ),
+        (
+            WKeyCode::Char('N'),
+            Modifiers::SHIFT,
+            KeyAssignment::CopyMode(CopyModeAssignment::PriorMatch),
+        ),
     ] {
         table.insert((key, mods), KeyTableEntry { action });
     }
@@ -2564,4 +2614,119 @@ pub fn copy_key_table() -> KeyTable {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use wezterm_term::{CellAttributes, Line};
+
+    // --- gutter width ---
+
+    #[test]
+    fn gutter_width_single_digit_viewport() {
+        // viewport_rows=9 → "9".len()=1, +1 space = 2
+        assert_eq!(line_number_gutter_width(9), 2);
+    }
+
+    #[test]
+    fn gutter_width_double_digit_viewport() {
+        // viewport_rows=24 → "24".len()=2, +1 space = 3
+        assert_eq!(line_number_gutter_width(24), 3);
+        assert_eq!(line_number_gutter_width(99), 3);
+    }
+
+    #[test]
+    fn gutter_width_triple_digit_viewport() {
+        assert_eq!(line_number_gutter_width(100), 4);
+        assert_eq!(line_number_gutter_width(999), 4);
+    }
+
+    // --- label formatting ---
+
+    #[test]
+    fn label_cursor_line_is_zero() {
+        // rel=0, gutter_width=3 → " 0 " (2 digits wide + space)
+        let label = line_number_label(0, 3);
+        assert_eq!(label.len(), 3);
+        assert_eq!(label, " 0 ");
+    }
+
+    #[test]
+    fn label_above_cursor() {
+        // rel=-3 → abs=3, gutter_width=3 → " 3 "
+        let label = line_number_label(-3, 3);
+        assert_eq!(label, " 3 ");
+    }
+
+    #[test]
+    fn label_below_cursor() {
+        // rel=5 → abs=5, gutter_width=3 → " 5 "
+        let label = line_number_label(5, 3);
+        assert_eq!(label, " 5 ");
+    }
+
+    #[test]
+    fn label_right_aligned() {
+        // rel=7, gutter_width=4 → "  7 " (3-digit field)
+        let label = line_number_label(7, 4);
+        assert_eq!(label.len(), 4);
+        assert_eq!(label, "  7 ");
+    }
+
+    #[test]
+    fn label_fills_full_width() {
+        // rel=99, gutter_width=3 → "99 "
+        let label = line_number_label(99, 3);
+        assert_eq!(label.len(), 3);
+        assert_eq!(label, "99 ");
+    }
+
+    // --- Line cell shifting ---
+
+    fn line_to_string(line: &mut Line) -> String {
+        line.cells_mut()
+            .iter()
+            .map(|c| c.str().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn insert_cells_shifts_content_right() {
+        let attr = CellAttributes::default();
+        let mut line = Line::from_text("hello", &attr, SEQ_ZERO, None);
+        assert_eq!(line.cells_mut()[0].str(), "h");
+
+        let gutter_width = 3;
+        for _ in 0..gutter_width {
+            line.insert_cell(0, Cell::blank(), 80, SEQ_ZERO);
+        }
+
+        // Original 'h' should now be at column gutter_width
+        assert_eq!(line.cells_mut()[gutter_width].str(), "h");
+        // First gutter_width columns should be blank
+        for i in 0..gutter_width {
+            assert_eq!(line.cells_mut()[i].str(), " ");
+        }
+    }
+
+    #[test]
+    fn overlay_label_after_shift() {
+        let attr = CellAttributes::default();
+        let mut line = Line::from_text("world", &attr, SEQ_ZERO, None);
+
+        let gutter_width = 3;
+        for _ in 0..gutter_width {
+            line.insert_cell(0, Cell::blank(), 80, SEQ_ZERO);
+        }
+
+        let label = line_number_label(2, gutter_width);
+        line.overlay_text_with_attribute(0, &label, CellAttributes::default(), SEQ_ZERO);
+
+        // Gutter shows the label
+        let rendered: String = line.cells_mut()[0..gutter_width]
+            .iter()
+            .map(|c: &Cell| c.str().to_string())
+            .collect();
+        assert_eq!(rendered, " 2 ");
+
+        // Original content starts at gutter_width
+        assert_eq!(line.cells_mut()[gutter_width].str(), "w");
+    }
 }
