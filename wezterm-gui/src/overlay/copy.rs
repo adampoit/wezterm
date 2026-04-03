@@ -121,6 +121,9 @@ struct CopyRenderable {
     pending_jump: Option<PendingJump>,
     last_jump: Option<Jump>,
     pending_key: Option<PendingKey>,
+    /// Content-space selection range (no gutter offset) used for copying text.
+    /// Kept in sync with the gutter-offset range stored in TermWindow.
+    content_selection: Option<SelectionRange>,
 }
 
 struct Searching {
@@ -254,6 +257,7 @@ impl CopyOverlay {
             pending_jump: None,
             last_jump: None,
             pending_key: None,
+            content_selection: None,
         };
 
         let search_row = render.compute_search_row();
@@ -512,6 +516,7 @@ impl CopyRenderable {
     }
 
     fn clear_selection(&mut self) {
+        self.content_selection = None;
         let pane_id = self.delegate.pane_id();
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
@@ -599,10 +604,24 @@ impl CopyRenderable {
         }
     }
 
-    fn adjust_selection(&self, start: SelectionCoordinate, range: SelectionRange) {
+    fn adjust_selection(&mut self, start: SelectionCoordinate, range: SelectionRange) {
+        // Save content-space range for use when copying text.
+        self.content_selection = Some(range);
+
         let pane_id = self.delegate.pane_id();
         let window = self.window.clone();
         let mode = self.selection_mode;
+        let gutter_width = line_number_gutter_width(self.delegate.get_dimensions().viewport_rows);
+        let offset_coord = |c: SelectionCoordinate| SelectionCoordinate {
+            x: c.x.saturating_add(gutter_width),
+            y: c.y,
+        };
+        let offset_range = |r: SelectionRange| SelectionRange {
+            start: offset_coord(r.start),
+            end: offset_coord(r.end),
+        };
+        let start = offset_coord(start);
+        let range = offset_range(range);
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
                 let mut selection = term_window.selection(pane_id);
@@ -1134,16 +1153,15 @@ impl CopyRenderable {
     }
 
     fn copy_selection_and_close(&self) {
-        let pane = Arc::clone(&self.delegate);
-        let window = self.window.clone();
-        window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-            term_window.copy_to_clipboard(
-                ClipboardCopyDestination::ClipboardAndPrimarySelection,
-                term_window.selection_text(&pane),
-            );
-        })));
-        self.set_viewport(None);
-        self.close();
+        // Use content_selection (content-space, no gutter offset) for accurate text extraction.
+        // The gutter-offset range in TermWindow is only for visual highlighting.
+        if let Some(range) = self.content_selection {
+            let text = self.text_for_selection_range(range);
+            self.copy_text_and_close(text);
+        } else {
+            self.set_viewport(None);
+            self.close();
+        }
     }
 
     fn copy_inner_word_and_close(&mut self) {
@@ -1729,7 +1747,37 @@ impl Pane for CopyOverlay {
     }
 
     fn get_logical_lines(&self, lines: Range<StableRowIndex>) -> Vec<LogicalLine> {
-        self.delegate.get_logical_lines(lines)
+        let renderer = self.render.lock();
+        let gutter_width =
+            line_number_gutter_width(self.delegate.get_dimensions().viewport_rows);
+        let search_row = renderer.compute_search_row();
+        let cursor_y = renderer.cursor.y;
+        drop(renderer);
+
+        let mut logical_lines = self.delegate.get_logical_lines(lines);
+        for ll in &mut logical_lines {
+            for (idx, phys) in ll.physical_lines.iter_mut().enumerate() {
+                let stable_y = ll.first_row + idx as StableRowIndex;
+                if stable_y == search_row {
+                    continue;
+                }
+                let cols = phys.len().max(gutter_width);
+                for _ in 0..gutter_width {
+                    phys.insert_cell(0, Cell::blank(), cols, SEQ_ZERO);
+                }
+                let rel: isize = stable_y - cursor_y;
+                let label = line_number_label(rel, gutter_width);
+                let num_attr = if rel == 0 {
+                    CellAttributes::default().set_reverse(true).clone()
+                } else {
+                    CellAttributes::default()
+                        .set_foreground(AnsiColor::Silver)
+                        .clone()
+                };
+                phys.overlay_text_with_attribute(0, &label, num_attr, SEQ_ZERO);
+            }
+        }
+        logical_lines
     }
 
     fn for_each_logical_line_in_stable_range_mut(
@@ -1825,25 +1873,41 @@ impl Pane for CopyOverlay {
                         line.clear_appdata();
                     } else if let Some(matches) = self.renderer.by_line.get(&stable_idx) {
                         for m in matches {
-                            if Some(m.result_index) != self.renderer.result_pos {
+                            let is_active = Some(m.result_index) == self.renderer.result_pos;
+                            if !is_active && !self.renderer.editing_search {
                                 continue;
                             }
                             for cell_idx in m.range.clone() {
                                 if let Some(cell) =
                                     line.cells_mut_for_attr_changes_only().get_mut(cell_idx)
                                 {
-                                    cell.attrs_mut()
-                                        .set_background(
-                                            colors
-                                                .copy_mode_active_highlight_bg
-                                                .unwrap_or(AnsiColor::Yellow.into()),
-                                        )
-                                        .set_foreground(
-                                            colors
-                                                .copy_mode_active_highlight_fg
-                                                .unwrap_or(AnsiColor::Black.into()),
-                                        )
-                                        .set_reverse(false);
+                                    if is_active {
+                                        cell.attrs_mut()
+                                            .set_background(
+                                                colors
+                                                    .copy_mode_active_highlight_bg
+                                                    .unwrap_or(AnsiColor::Yellow.into()),
+                                            )
+                                            .set_foreground(
+                                                colors
+                                                    .copy_mode_active_highlight_fg
+                                                    .unwrap_or(AnsiColor::Black.into()),
+                                            )
+                                            .set_reverse(false);
+                                    } else {
+                                        cell.attrs_mut()
+                                            .set_background(
+                                                colors
+                                                    .copy_mode_inactive_highlight_bg
+                                                    .unwrap_or(AnsiColor::Purple.into()),
+                                            )
+                                            .set_foreground(
+                                                colors
+                                                    .copy_mode_inactive_highlight_fg
+                                                    .unwrap_or(AnsiColor::White.into()),
+                                            )
+                                            .set_reverse(false);
+                                    }
                                 }
                             }
                         }
@@ -1932,24 +1996,40 @@ impl Pane for CopyOverlay {
                 renderer.last_bar_pos = Some(search_row);
             } else if let Some(matches) = renderer.by_line.get(&stable_idx) {
                 for m in matches {
-                    if Some(m.result_index) != renderer.result_pos {
+                    let is_active = Some(m.result_index) == renderer.result_pos;
+                    if !is_active && !renderer.editing_search {
                         continue;
                     }
                     for cell_idx in m.range.clone() {
                         if let Some(cell) = line.cells_mut_for_attr_changes_only().get_mut(cell_idx)
                         {
-                            cell.attrs_mut()
-                                .set_background(
-                                    colors
-                                        .copy_mode_active_highlight_bg
-                                        .unwrap_or(AnsiColor::Yellow.into()),
-                                )
-                                .set_foreground(
-                                    colors
-                                        .copy_mode_active_highlight_fg
-                                        .unwrap_or(AnsiColor::Black.into()),
-                                )
-                                .set_reverse(false);
+                            if is_active {
+                                cell.attrs_mut()
+                                    .set_background(
+                                        colors
+                                            .copy_mode_active_highlight_bg
+                                            .unwrap_or(AnsiColor::Yellow.into()),
+                                    )
+                                    .set_foreground(
+                                        colors
+                                            .copy_mode_active_highlight_fg
+                                            .unwrap_or(AnsiColor::Black.into()),
+                                    )
+                                    .set_reverse(false);
+                            } else {
+                                cell.attrs_mut()
+                                    .set_background(
+                                        colors
+                                            .copy_mode_inactive_highlight_bg
+                                            .unwrap_or(AnsiColor::Purple.into()),
+                                    )
+                                    .set_foreground(
+                                        colors
+                                            .copy_mode_inactive_highlight_fg
+                                            .unwrap_or(AnsiColor::White.into()),
+                                    )
+                                    .set_reverse(false);
+                            }
                         }
                     }
                 }
