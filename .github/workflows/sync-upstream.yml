@@ -31,7 +31,7 @@ permissions:
 
 jobs:
   sync:
-    uses: adampoit/patchlane/.github/workflows/patchlane.yml@6d7940f9870575c7c7d65a3d7561b7eef079132a
+    uses: adampoit/patchlane/.github/workflows/patchlane.yml@main
     with:
       upstream_owner: wezterm
       upstream_repo: wezterm
@@ -40,8 +40,6 @@ jobs:
       release_selector: ${{ github.event_name == 'workflow_dispatch' && inputs.release_selector || '' }}
       sync_branch: sync/integration
       patch_refs: ${{ github.event_name == 'workflow_dispatch' && inputs.patch_refs || 'patch/fork-ci, patch/vim-copy-mode, patch/font-thickening' }}
-      implementation_repository: adampoit/patchlane
-      implementation_ref: 6d7940f9870575c7c7d65a3d7561b7eef079132a
       dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
     secrets:
       # Use a PAT or GitHub App token so the sync_branch push can trigger Fork CI.
