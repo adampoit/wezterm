@@ -31,16 +31,33 @@ permissions:
 
 jobs:
   sync:
-    uses: adampoit/patchlane/.github/workflows/patchlane.yml@main
-    with:
-      upstream_owner: wezterm
-      upstream_repo: wezterm
-      base_branch: main
-      upstream_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.upstream_ref || 'main' }}
-      release_selector: ${{ github.event_name == 'workflow_dispatch' && inputs.release_selector || '' }}
-      sync_branch: sync/integration
-      patch_refs: ${{ github.event_name == 'workflow_dispatch' && inputs.patch_refs || 'patch/fork-ci, patch/vim-copy-mode, patch/font-thickening' }}
-      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
-    secrets:
-      # Use a PAT or GitHub App token so the sync_branch push can trigger Fork CI.
-      token: ${{ secrets.FORK_SYNC_TOKEN }}
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+      UPSTREAM_OWNER: wezterm
+      UPSTREAM_REPO: wezterm
+      BASE_BRANCH: main
+      UPSTREAM_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.upstream_ref || 'main' }}
+      RELEASE_SELECTOR: ${{ github.event_name == 'workflow_dispatch' && inputs.release_selector || '' }}
+      SYNC_BRANCH: sync/integration
+      PATCH_REFS: ${{ github.event_name == 'workflow_dispatch' && inputs.patch_refs || 'patch/fork-ci, patch/vim-copy-mode, patch/font-thickening' }}
+      DRY_RUN: ${{ inputs.dry_run || false }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run patchlane sync
+        run: npx patchlane@latest sync
