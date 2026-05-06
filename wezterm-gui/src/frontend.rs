@@ -55,6 +55,29 @@ impl GuiFrontEnd {
                     old_workspace,
                     new_workspace,
                 } => {
+                    let event_old_workspace = old_workspace.clone();
+                    let event_new_workspace = new_workspace.clone();
+                    promise::spawn::spawn(async move {
+                        let result =
+                            config::with_lua_config_on_main_thread(move |lua| async move {
+                                if let Some(lua) = lua {
+                                    let args =
+                                        lua.pack_multi((event_old_workspace, event_new_workspace))?;
+                                    config::lua::emit_event(
+                                        &lua,
+                                        ("workspace-renamed".to_string(), args),
+                                    )
+                                    .await?;
+                                }
+                                anyhow::Result::<()>::Ok(())
+                            })
+                            .await;
+                        if let Err(err) = result {
+                            log::error!("while processing workspace-renamed event: {err:#}");
+                        }
+                    })
+                    .detach();
+
                     let mux = Mux::get();
                     let active = mux.active_workspace();
                     if active == old_workspace || active == new_workspace {
@@ -65,10 +88,62 @@ impl GuiFrontEnd {
                         .detach();
                     }
                 }
+                MuxNotification::WorkspaceClosed { workspace } => {
+                    promise::spawn::spawn(async move {
+                        let result =
+                            config::with_lua_config_on_main_thread(move |lua| async move {
+                                if let Some(lua) = lua {
+                                    let args = lua.pack_multi(workspace)?;
+                                    config::lua::emit_event(
+                                        &lua,
+                                        ("workspace-closed".to_string(), args),
+                                    )
+                                    .await?;
+                                }
+                                anyhow::Result::<()>::Ok(())
+                            })
+                            .await;
+                        if let Err(err) = result {
+                            log::error!("while processing workspace-closed event: {err:#}");
+                        }
+                    })
+                    .detach();
+                }
                 MuxNotification::WindowWorkspaceChanged(_)
-                | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::WindowCreated(_)
                 | MuxNotification::WindowRemoved(_) => {
+                    promise::spawn::spawn_into_main_thread(async move {
+                        let fe = crate::frontend::front_end();
+                        if !fe.is_switching_workspace() {
+                            fe.reconcile_workspace();
+                        }
+                    })
+                    .detach();
+                }
+                MuxNotification::ActiveWorkspaceChanged(active_client_id) => {
+                    if active_client_id == client_id {
+                        let workspace = Mux::get().active_workspace_for_client(&active_client_id);
+                        promise::spawn::spawn(async move {
+                            let result =
+                                config::with_lua_config_on_main_thread(move |lua| async move {
+                                    if let Some(lua) = lua {
+                                        let args = lua.pack_multi(workspace)?;
+                                        config::lua::emit_event(
+                                            &lua,
+                                            ("workspace-activated".to_string(), args),
+                                        )
+                                        .await?;
+                                    }
+                                    anyhow::Result::<()>::Ok(())
+                                })
+                                .await;
+                            if let Err(err) = result {
+                                log::error!("while processing workspace-activated event: {err:#}");
+                            }
+                        })
+                        .detach();
+                    }
+
                     promise::spawn::spawn_into_main_thread(async move {
                         let fe = crate::frontend::front_end();
                         if !fe.is_switching_workspace() {

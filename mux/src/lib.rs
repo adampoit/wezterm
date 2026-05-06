@@ -95,6 +95,9 @@ pub enum MuxNotification {
         old_workspace: String,
         new_workspace: String,
     },
+    WorkspaceClosed {
+        workspace: String,
+    },
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);
@@ -464,7 +467,8 @@ impl Mux {
         std::thread::current().id() == self.main_thread_id
     }
 
-    fn recompute_pane_count(&self) {
+    fn recompute_pane_count(&self) -> Vec<String> {
+        let prior = self.num_panes_by_workspace.read().clone();
         let mut count = HashMap::new();
         for window in self.windows.read().values() {
             let workspace = window.get_workspace();
@@ -473,12 +477,25 @@ impl Mux {
                     Some(n) => n,
                     None => {
                         // Busy: abort this and we'll retry later
-                        return;
+                        return vec![];
                     }
                 };
             }
         }
+        let closed = prior
+            .keys()
+            .filter(|workspace| !count.contains_key(*workspace))
+            .cloned()
+            .collect();
         *self.num_panes_by_workspace.write() = count;
+        closed
+    }
+
+    fn recompute_pane_count_and_notify_closed(&self) {
+        let closed = self.recompute_pane_count();
+        for workspace in closed {
+            self.notify(MuxNotification::WorkspaceClosed { workspace });
+        }
     }
 
     pub fn client_had_input(&self, client_id: &ClientId) {
@@ -655,7 +672,7 @@ impl Mux {
                 window.set_workspace(new_workspace);
             }
         }
-        self.recompute_pane_count();
+        let _ = self.recompute_pane_count();
         for client in self.clients.write().values_mut() {
             if client.active_workspace.as_deref() == Some(old_workspace) {
                 client.active_workspace.replace(new_workspace.to_string());
@@ -791,14 +808,14 @@ impl Mux {
             let pane = Arc::downgrade(pane);
             thread::spawn(move || read_from_pane_pty(pane, banner, reader));
         }
-        self.recompute_pane_count();
+        let _ = self.recompute_pane_count();
         self.notify(MuxNotification::PaneAdded(pane_id));
         Ok(())
     }
 
     pub fn add_tab_no_panes(&self, tab: &Arc<Tab>) {
         self.tabs.write().insert(tab.tab_id(), Arc::clone(tab));
-        self.recompute_pane_count();
+        let _ = self.recompute_pane_count();
     }
 
     pub fn add_tab_and_active_pane(&self, tab: &Arc<Tab>) -> Result<(), Error> {
@@ -820,7 +837,7 @@ impl Mux {
         }
 
         if changed {
-            self.recompute_pane_count();
+            self.recompute_pane_count_and_notify_closed();
         }
     }
 
@@ -843,7 +860,7 @@ impl Mux {
         for pane_id in pane_ids {
             self.remove_pane_internal(pane_id);
         }
-        self.recompute_pane_count();
+        self.recompute_pane_count_and_notify_closed();
 
         Some(tab)
     }
@@ -880,7 +897,7 @@ impl Mux {
             }
             self.notify(MuxNotification::WindowRemoved(window_id));
         }
-        self.recompute_pane_count();
+        self.recompute_pane_count_and_notify_closed();
     }
 
     pub fn remove_pane(&self, pane_id: PaneId) {
@@ -1000,7 +1017,7 @@ impl Mux {
                 .ok_or_else(|| anyhow!("add_tab_to_window: no such window_id {}", window_id))?;
             window.push(tab);
         }
-        self.recompute_pane_count();
+        let _ = self.recompute_pane_count();
         self.notify(MuxNotification::TabAddedToWindow { tab_id, window_id });
         Ok(())
     }
