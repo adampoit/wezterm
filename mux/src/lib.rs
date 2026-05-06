@@ -652,9 +652,17 @@ impl Mux {
     }
 
     pub fn set_active_workspace_for_client(&self, ident: &Arc<ClientId>, workspace: &str) {
-        let mut clients = self.clients.write();
-        if let Some(info) = clients.get_mut(&ident) {
-            info.active_workspace.replace(workspace.to_string());
+        let changed = {
+            let mut clients = self.clients.write();
+            if let Some(info) = clients.get_mut(&ident) {
+                info.active_workspace.replace(workspace.to_string());
+                true
+            } else {
+                false
+            }
+        };
+
+        if changed {
             self.notify(MuxNotification::ActiveWorkspaceChanged(ident.clone()));
         }
     }
