@@ -798,6 +798,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Help"],
             icon: Some("cod_debug"),
         },
+        ShowRepaintDebugOverlay => CommandDef {
+            brief: "Show repaint debug overlay".into(),
+            doc: "Activates the live repaint diagnostics overlay".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["Help"],
+            icon: Some("cod_debug"),
+        },
         InputSelector(_) => CommandDef {
             brief: "Prompt the user to choose from a list".into(),
             doc: "Activates the selector overlay and wait for input".into(),
@@ -2141,6 +2149,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         OpenUri("https://github.com/wezterm/wezterm/discussions/".to_string()),
         OpenUri("https://github.com/wezterm/wezterm/issues/".to_string()),
         ShowDebugOverlay,
+        ShowRepaintDebugOverlay,
         // ----------------- Misc
         OpenLinkAtMouseCursor,
     ];

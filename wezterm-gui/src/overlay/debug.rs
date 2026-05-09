@@ -1,4 +1,5 @@
 use crate::scripting::guiwin::GuiWin;
+use crate::termwindow::{RepaintStats, TermWindowNotif};
 use chrono::prelude::*;
 use futures::FutureExt;
 use log::Level;
@@ -10,13 +11,88 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use termwiz::cell::{AttributeChange, CellAttributes, Intensity};
 use termwiz::color::AnsiColor;
-use termwiz::input::{InputEvent, KeyCode, KeyEvent};
+use termwiz::input::{InputEvent, KeyCode, KeyEvent, Modifiers};
 use termwiz::lineedit::*;
-use termwiz::surface::Change;
+use termwiz::surface::{Change, Position};
 use termwiz::terminal::Terminal;
+use window::WindowOps;
 
 lazy_static::lazy_static! {
     static ref LATEST_LOG_ENTRY: Mutex<Option<DateTime<Local>>> = Mutex::new(None);
+}
+
+fn repaint_stats(gui_win: &GuiWin) -> anyhow::Result<RepaintStats> {
+    let (tx, rx) = smol::channel::bounded(1);
+    gui_win.window.notify(TermWindowNotif::GetRepaintStats(tx));
+    Ok(futures::executor::block_on(rx.recv())?)
+}
+
+fn format_ms_ago(value: Option<u64>) -> String {
+    value
+        .map(|value| format!("{value}ms ago"))
+        .unwrap_or_else(|| "never".to_string())
+}
+
+pub fn show_repaint_debug_overlay(
+    mut term: TermWizTerminal,
+    gui_win: GuiWin,
+) -> anyhow::Result<()> {
+    term.no_grab_mouse_in_raw_mode();
+
+    loop {
+        let stats = repaint_stats(&gui_win)?;
+        term.render(&[
+            Change::Title("Repaint Debug".to_string()),
+            Change::CursorPosition {
+                x: Position::Absolute(0),
+                y: Position::Absolute(0),
+            },
+            Change::ClearScreen(Default::default()),
+            Change::Text(format!(
+                "Repaint Debug Overlay\r\n\
+                 Press ESC or CTRL-D to exit. Refreshes once per second.\r\n\r\n\
+                 Window: {}    Workspace: {}    Renderer: {}\r\n\
+                 FPS: {:.1}    Last frame: {:.2}ms\r\n\r\n\
+                 NeedRepaint count: {}    last: {}\r\n\
+                 Paint count:       {}    started: {}    finished: {}\r\n\
+                 Present ok/fail:   {}/{}    last present: {}\r\n\r\n\
+                 Invalidates since last paint: {}\r\n\
+                 resizes_pending: {}    is_repaint_pending: {}\r\n\r\n\
+                 If NeedRepaint stops moving while output is expected, look below TermWindow.\r\n\
+                 If paint moves but present does not, look at renderer/window presentation.\r\n",
+                stats.mux_window_id,
+                stats.active_workspace,
+                stats.renderer,
+                stats.fps,
+                stats.last_frame_duration_ms,
+                stats.need_repaint_count,
+                format_ms_ago(stats.last_need_repaint_ms_ago),
+                stats.paint_count,
+                format_ms_ago(stats.last_paint_started_ms_ago),
+                format_ms_ago(stats.last_paint_finished_ms_ago),
+                stats.successful_present_count,
+                stats.failed_present_count,
+                format_ms_ago(stats.last_present_ms_ago),
+                stats.invalidates_since_last_paint,
+                stats.resizes_pending,
+                stats.is_repaint_pending,
+            )),
+        ])?;
+
+        match term.poll_input(Some(std::time::Duration::from_secs(1)))? {
+            Some(InputEvent::Key(KeyEvent {
+                key: KeyCode::Escape,
+                ..
+            })) => break,
+            Some(InputEvent::Key(KeyEvent {
+                key: KeyCode::Char('d'),
+                modifiers,
+            })) if modifiers.contains(Modifiers::CTRL) => break,
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 struct LuaReplHost {
@@ -142,7 +218,7 @@ pub fn show_debug_overlay(
     };
 
     lua.load("wezterm = require 'wezterm'").exec()?;
-    lua.globals().set("window", gui_win)?;
+    lua.globals().set("window", gui_win.clone())?;
     let lua_version: String = lua.globals().get("_VERSION")?;
 
     let mut host = Some(LuaReplHost::new(lua));
@@ -189,6 +265,7 @@ pub fn show_debug_overlay(
 
     let version = config::wezterm_version();
     let triple = config::wezterm_target_triple();
+    let stats = repaint_stats(&gui_win)?;
 
     term.render(&[Change::Text(format!(
         "Debug Overlay\r\n\
@@ -196,8 +273,23 @@ pub fn show_debug_overlay(
          Window Environment: {connection_info}\r\n\
          Lua Version: {lua_version}\r\n\
          {opengl_info}\r\n\
+         Repaint: fps={:.1}, last_frame={:.2}ms, NeedRepaint={} ({}), paint={} ({}), present={}/{} ({})\r\n\
+         Repaint details: invalidates_since_last_paint={}, resizes_pending={}, is_repaint_pending={}\r\n\
+         Evaluate window:repaint_stats() to refresh repaint diagnostics.\r\n\
          Enter lua statements or expressions and hit Enter.\r\n\
          Press ESC or CTRL-D to exit\r\n",
+        stats.fps,
+        stats.last_frame_duration_ms,
+        stats.need_repaint_count,
+        format_ms_ago(stats.last_need_repaint_ms_ago),
+        stats.paint_count,
+        format_ms_ago(stats.last_paint_finished_ms_ago),
+        stats.successful_present_count,
+        stats.failed_present_count,
+        format_ms_ago(stats.last_present_ms_ago),
+        stats.invalidates_since_last_paint,
+        stats.resizes_pending,
+        stats.is_repaint_pending,
     ))])?;
 
     loop {
