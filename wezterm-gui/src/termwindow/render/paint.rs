@@ -16,6 +16,8 @@ pub enum AllowImage {
 impl crate::TermWindow {
     pub fn paint_impl(&mut self, frame: &mut RenderFrame) {
         self.num_frames += 1;
+        self.repaint_stats.paint_count += 1;
+        self.repaint_stats.invalidates_since_last_paint = 0;
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
         *self.has_animation.borrow_mut() = None;
@@ -23,6 +25,7 @@ impl crate::TermWindow {
         self.allow_images = AllowImage::Yes;
 
         let start = Instant::now();
+        self.repaint_stats.last_paint_started = Some(start);
 
         {
             let diff = start.duration_since(self.last_fps_check_time);
@@ -107,6 +110,7 @@ impl crate::TermWindow {
 
         self.call_draw(frame).ok();
         self.last_frame_duration = start.elapsed();
+        self.repaint_stats.last_paint_finished = Some(Instant::now());
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
             self.last_frame_duration,

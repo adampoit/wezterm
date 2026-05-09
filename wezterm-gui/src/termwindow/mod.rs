@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SequenceNo;
-use wezterm_dynamic::Value;
+use wezterm_dynamic::{ToDynamic, Value};
 use wezterm_font::FontConfiguration;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
@@ -125,6 +125,7 @@ pub enum TermWindowNotif {
     SetLeftStatus(String),
     SetRightStatus(String),
     GetDimensions(Sender<(Dimensions, WindowState)>),
+    GetRepaintStats(Sender<RepaintStats>),
     GetSelectionForPane {
         pane_id: PaneId,
         tx: Sender<String>,
@@ -149,6 +150,40 @@ pub enum TermWindowNotif {
         width: usize,
         height: usize,
     },
+}
+
+#[derive(Clone, Debug, Default, wezterm_dynamic::FromDynamic, wezterm_dynamic::ToDynamic)]
+pub struct RepaintStats {
+    pub fps: f32,
+    pub last_frame_duration_ms: f64,
+    pub paint_count: usize,
+    pub need_repaint_count: usize,
+    pub successful_present_count: usize,
+    pub failed_present_count: usize,
+    pub invalidates_since_last_paint: usize,
+    pub last_need_repaint_ms_ago: Option<u64>,
+    pub last_paint_started_ms_ago: Option<u64>,
+    pub last_paint_finished_ms_ago: Option<u64>,
+    pub last_present_ms_ago: Option<u64>,
+    pub resizes_pending: usize,
+    pub is_repaint_pending: bool,
+    pub renderer: String,
+    pub mux_window_id: usize,
+    pub active_workspace: String,
+}
+luahelper::impl_lua_conversion_dynamic!(RepaintStats);
+
+#[derive(Clone, Debug, Default)]
+struct RepaintStatsState {
+    paint_count: usize,
+    need_repaint_count: usize,
+    successful_present_count: usize,
+    failed_present_count: usize,
+    invalidates_since_last_paint: usize,
+    last_need_repaint: Option<Instant>,
+    last_paint_started: Option<Instant>,
+    last_paint_finished: Option<Instant>,
+    last_present: Option<Instant>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -457,6 +492,7 @@ pub struct TermWindow {
     last_fps_check_time: Instant,
     num_frames: usize,
     pub fps: f32,
+    repaint_stats: RepaintStatsState,
 
     connection_name: String,
 
@@ -466,6 +502,37 @@ pub struct TermWindow {
 }
 
 impl TermWindow {
+    fn elapsed_ms_ago(instant: Option<Instant>) -> Option<u64> {
+        instant.map(|instant| instant.elapsed().as_millis() as u64)
+    }
+
+    pub fn repaint_stats_snapshot(&self) -> RepaintStats {
+        RepaintStats {
+            fps: self.fps,
+            last_frame_duration_ms: self.last_frame_duration.as_secs_f64() * 1000.,
+            paint_count: self.repaint_stats.paint_count,
+            need_repaint_count: self.repaint_stats.need_repaint_count,
+            successful_present_count: self.repaint_stats.successful_present_count,
+            failed_present_count: self.repaint_stats.failed_present_count,
+            invalidates_since_last_paint: self.repaint_stats.invalidates_since_last_paint,
+            last_need_repaint_ms_ago: Self::elapsed_ms_ago(self.repaint_stats.last_need_repaint),
+            last_paint_started_ms_ago: Self::elapsed_ms_ago(self.repaint_stats.last_paint_started),
+            last_paint_finished_ms_ago: Self::elapsed_ms_ago(
+                self.repaint_stats.last_paint_finished,
+            ),
+            last_present_ms_ago: Self::elapsed_ms_ago(self.repaint_stats.last_present),
+            resizes_pending: self.resizes_pending,
+            is_repaint_pending: self.is_repaint_pending,
+            renderer: if self.webgpu.is_some() {
+                "WebGPU".to_string()
+            } else {
+                "OpenGL".to_string()
+            },
+            mux_window_id: self.mux_window_id,
+            active_workspace: Mux::get().active_workspace(),
+        }
+    }
+
     fn load_os_parameters(&mut self) {
         if let Some(ref window) = self.window {
             self.os_parameters = match window.get_os_parameters(&self.config, self.window_state) {
@@ -684,6 +751,7 @@ impl TermWindow {
             num_frames: 0,
             last_frame_duration: Duration::ZERO,
             fps: 0.,
+            repaint_stats: RepaintStatsState::default(),
             config_subscription: None,
             os_parameters: None,
             gl: None,
@@ -999,6 +1067,9 @@ impl TermWindow {
                 Ok(true)
             }
             WindowEvent::NeedRepaint => {
+                self.repaint_stats.need_repaint_count += 1;
+                self.repaint_stats.invalidates_since_last_paint += 1;
+                self.repaint_stats.last_need_repaint = Some(Instant::now());
                 if self.resizes_pending > 0 {
                     self.is_repaint_pending = true;
                     Ok(true)
@@ -1080,7 +1151,14 @@ impl TermWindow {
             ),
         );
         self.paint_impl(&mut RenderFrame::Glium(&mut frame));
-        window.finish_frame(frame).is_ok()
+        let ok = window.finish_frame(frame).is_ok();
+        if ok {
+            self.repaint_stats.successful_present_count += 1;
+            self.repaint_stats.last_present = Some(Instant::now());
+        } else {
+            self.repaint_stats.failed_present_count += 1;
+        }
+        ok
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
@@ -1102,6 +1180,8 @@ impl TermWindow {
 
     fn do_paint_webgpu_impl(&mut self) -> anyhow::Result<bool> {
         self.paint_impl(&mut RenderFrame::WebGpu);
+        self.repaint_stats.successful_present_count += 1;
+        self.repaint_stats.last_present = Some(Instant::now());
         Ok(true)
     }
 
@@ -1168,6 +1248,11 @@ impl TermWindow {
                 tx.try_send((self.dimensions, self.window_state))
                     .map_err(chan_err)
                     .context("send GetDimensions response")?;
+            }
+            TermWindowNotif::GetRepaintStats(tx) => {
+                tx.try_send(self.repaint_stats_snapshot())
+                    .map_err(chan_err)
+                    .context("send GetRepaintStats response")?;
             }
             TermWindowNotif::GetEffectiveConfig(tx) => {
                 tx.try_send(self.config.clone())
@@ -2367,6 +2452,21 @@ impl TermWindow {
         promise::spawn::spawn(future).detach();
     }
 
+    fn show_repaint_debug_overlay(&mut self) {
+        let mux = Mux::get();
+        let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+            Some(tab) => tab,
+            None => return,
+        };
+
+        let gui_win = GuiWin::new(self);
+        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
+            crate::overlay::show_repaint_debug_overlay(term, gui_win)
+        });
+        self.assign_overlay(tab.tab_id(), overlay);
+        promise::spawn::spawn(future).detach();
+    }
+
     fn show_tab_navigator(&mut self) {
         let mux = Mux::get();
         let active_tab_idx = match mux.get_window(self.mux_window_id) {
@@ -2777,6 +2877,7 @@ impl TermWindow {
             ScrollToBottom => self.scroll_to_bottom(pane),
             ShowTabNavigator => self.show_tab_navigator(),
             ShowDebugOverlay => self.show_debug_overlay(),
+            ShowRepaintDebugOverlay => self.show_repaint_debug_overlay(),
             ShowLauncher => self.show_launcher(),
             ShowLauncherArgs(args) => {
                 let title = args.title.clone().unwrap_or("Launcher".to_string());

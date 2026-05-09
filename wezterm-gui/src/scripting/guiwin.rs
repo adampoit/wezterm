@@ -1,6 +1,6 @@
 //! GuiWin represents a Gui TermWindow (as opposed to a Mux window) in lua code
 use super::luaerr;
-use crate::termwindow::TermWindowNotif;
+use crate::termwindow::{RepaintStats, TermWindowNotif};
 use crate::TermWindow;
 use config::keyassignment::{ClipboardCopyDestination, KeyAssignment};
 use luahelper::*;
@@ -130,6 +130,12 @@ impl UserData for GuiWin {
                 // FIXME: expose other states here
             };
             Ok(dims)
+        });
+        methods.add_async_method("repaint_stats", |_, this, _: ()| async move {
+            let (tx, rx) = smol::channel::bounded(1);
+            this.window.notify(TermWindowNotif::GetRepaintStats(tx));
+            let stats: RepaintStats = rx.recv().await.map_err(mlua::Error::external)?;
+            Ok(stats)
         });
         methods.add_async_method(
             "get_selection_text_for_pane",

@@ -3061,8 +3061,10 @@ impl WindowView {
             }
 
             if inner.paint_throttled {
+                log::trace!("draw_rect deferred while paint_throttled; marking invalidated");
                 inner.invalidated = true;
             } else {
+                log::trace!("draw_rect dispatching NeedRepaint");
                 inner.events.dispatch(WindowEvent::NeedRepaint);
                 inner.invalidated = false;
                 inner.paint_throttled = true;
@@ -3077,9 +3079,14 @@ impl WindowView {
                             let mut state = window_view.inner.borrow_mut();
                             state.paint_throttled = false;
                             if state.invalidated {
+                                log::trace!(
+                                    "paint throttle elapsed with pending invalidation; setNeedsDisplay"
+                                );
                                 unsafe {
                                     let () = msg_send![*inner.view, setNeedsDisplay: YES];
                                 }
+                            } else {
+                                log::trace!("paint throttle elapsed with no pending invalidation");
                             }
                         }
                         Ok(())
