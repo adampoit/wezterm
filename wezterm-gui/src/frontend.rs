@@ -89,6 +89,14 @@ impl GuiFrontEnd {
                     }
                 }
                 MuxNotification::WorkspaceClosed { workspace } => {
+                    promise::spawn::spawn_into_main_thread(async move {
+                        let fe = crate::frontend::front_end();
+                        if !fe.is_switching_workspace() {
+                            fe.reconcile_workspace();
+                        }
+                    })
+                    .detach();
+
                     promise::spawn::spawn(async move {
                         let result =
                             config::with_lua_config_on_main_thread(move |lua| async move {
