@@ -78,6 +78,7 @@ pub fn show_repaint_debug_overlay(
                 stats.is_repaint_pending,
             )),
         ])?;
+        term.flush()?;
 
         match term.poll_input(Some(std::time::Duration::from_secs(1)))? {
             Some(InputEvent::Key(KeyEvent {
@@ -85,7 +86,7 @@ pub fn show_repaint_debug_overlay(
                 ..
             })) => break,
             Some(InputEvent::Key(KeyEvent {
-                key: KeyCode::Char('d'),
+                key: KeyCode::Char('D'),
                 modifiers,
             })) if modifiers.contains(Modifiers::CTRL) => break,
             _ => {}
