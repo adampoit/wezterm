@@ -1447,13 +1447,15 @@ impl TermWindow {
     fn mux_pane_output_event_callback(
         n: MuxNotification,
         window: &Window,
-        mux_window_id: MuxWindowId,
+        mux_window_id: &Arc<Mutex<MuxWindowId>>,
         dead: &Arc<AtomicBool>,
     ) -> bool {
         if dead.load(Ordering::Relaxed) {
             // Subscription cancelled asynchronously
             return false;
         }
+
+        let mux_window_id = *mux_window_id.lock().unwrap();
 
         match n {
             MuxNotification::Alert {
@@ -1548,11 +1550,11 @@ impl TermWindow {
                 // Unsubscribe this handler from the mux
                 return false;
             }
-            let mux_window_id = *mux_window_id.lock().unwrap();
+            let mux_window_id = Arc::clone(&mux_window_id);
             let window = window.clone();
             let dead = dead.clone();
             promise::spawn::spawn_into_main_thread(async move {
-                Self::mux_pane_output_event_callback(n, &window, mux_window_id, &dead)
+                Self::mux_pane_output_event_callback(n, &window, &mux_window_id, &dead)
             })
             .detach();
             true
