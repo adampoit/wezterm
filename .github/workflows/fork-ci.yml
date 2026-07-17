@@ -1,0 +1,245 @@
+name: Fork CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - sync/integration
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package (ubuntu24.04)
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/sync/integration'
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    env:
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+
+    steps:
+      - name: set APT to non-interactive
+        shell: bash
+        run: "echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections"
+      - name: Update APT
+        shell: bash
+        run: "apt update"
+      - name: Install git
+        shell: bash
+        run: "apt-get install -y git"
+      - name: Install curl
+        shell: bash
+        run: "apt-get install -y curl"
+      - name: Update APT
+        shell: bash
+        run: "apt update"
+      - name: Ensure /run/sshd exists
+        shell: bash
+        run: "mkdir -p /run/sshd"
+      - name: Install openssh-server
+        shell: bash
+        run: "apt-get install -y openssh-server"
+      - name: Workaround git permissions issue
+        shell: bash
+        run: "git config --global --add safe.directory /__w/wezterm/wezterm"
+      - name: checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Compile with sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Rust Dependencies
+        uses: actions/cache@v4
+        id: cache-cargo-vendor
+        with:
+          path: |
+            vendor
+            .cargo/config
+          key: cargo-deps-${{ hashFiles('**/Cargo.lock') }}
+      - name: Vendor dependecies
+        if: steps.cache-cargo-vendor.outputs.cache-hit != 'true'
+        shell: bash
+        run: "cargo vendor --locked --versioned-dirs >> .cargo/config"
+      - name: Install System Deps
+        shell: bash
+        run: "env CI=yes PATH=$PATH ./get-deps"
+      - name: Build wezterm
+        shell: bash
+        run: "cargo build -p wezterm --release"
+      - name: Build wezterm-gui
+        shell: bash
+        run: "cargo build -p wezterm-gui --release"
+      - name: Build wezterm-mux-server
+        shell: bash
+        run: "cargo build -p wezterm-mux-server --release"
+      - name: Build strip-ansi-escapes
+        shell: bash
+        run: "cargo build -p strip-ansi-escapes --release"
+      - name: Install cargo-nextest from Cargo
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          cache-key: patchlane-sync-ubuntu24.04
+      - name: Test
+        shell: bash
+        run: "cargo nextest run --all --no-fail-fast"
+      - name: Package
+        shell: bash
+        run: "bash ci/deploy.sh"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-sync-ubuntu24.04
+          path: |
+            wezterm-*.deb
+            wezterm-*.xz
+          retention-days: 5
+
+  windows:
+    name: package (windows)
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/sync/integration' || github.ref == 'refs/heads/main')
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    env:
+      BUILD_REASON: Schedule
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+      RUSTUP_WINDOWS_PATH_ADD_BIN: "1"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: x86_64-pc-windows-msvc
+      - name: Compile with sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        id: cache-cargo-vendor
+        with:
+          path: |
+            vendor
+            .cargo/config
+          key: cargo-deps-${{ hashFiles('**/Cargo.lock') }}
+      - name: Vendor dependencies
+        if: steps.cache-cargo-vendor.outputs.cache-hit != 'true'
+        shell: bash
+        run: cargo vendor --locked --versioned-dirs >> .cargo/config
+      - name: Build release binaries
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo build --release -p wezterm -p wezterm-gui -p wezterm-mux-server -p strip-ansi-escapes
+      - name: Install cargo-nextest
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          cache-key: patchlane-main-windows
+      - name: Test
+        shell: cmd
+        run: |
+          PATH C:\Strawberry\perl\bin;%PATH%
+          cargo nextest run --all --no-fail-fast
+      - name: Package
+        shell: bash
+        run: bash ci/deploy.sh
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fork-main-windows
+          path: |
+            WezTerm-windows-nightly.zip
+            WezTerm-nightly-setup.exe
+          retention-days: 5
+      - name: Update rolling release
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: fork-nightly
+        run: |
+          set -euo pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" \
+              -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" >/dev/null
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "Fork Nightly" --prerelease \
+              --notes "Unsigned Windows build from main at $GITHUB_SHA."
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --title "Fork Nightly" --prerelease \
+              --notes "Unsigned Windows build from main at $GITHUB_SHA."
+          fi
+
+          gh release upload "$RELEASE_TAG" --clobber \
+            WezTerm-windows-nightly.zip WezTerm-nightly-setup.exe
+
+  nix_build:
+    name: nix-build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+          - name: darwin
+            os: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Nix
+        uses: nixbuild/nix-quick-install-action@v34
+
+      - name: Select Nix flake ref
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            flake_ref=./nix
+          else
+            flake_ref='github:${{ github.repository }}/${{ github.sha }}?dir=nix'
+          fi
+          printf 'FLAKE_REF=%s\n' "$flake_ref" >> "$GITHUB_ENV"
+
+      - name: Evaluate flake outputs
+        run: |
+          set -euo pipefail
+          sys=$(nix eval --impure --expr builtins.currentSystem --raw)
+          nix --version
+          nix flake metadata "$FLAKE_REF"
+          nix flake show "$FLAKE_REF" --all-systems
+          nix eval "$FLAKE_REF#packages.${sys}.default.drvPath" --raw
+
+      - name: Build Nix package
+        run: |
+          set -euo pipefail
+          sys=$(nix eval --impure --expr builtins.currentSystem --raw)
+          nix build "$FLAKE_REF#packages.${sys}.default" --print-out-paths
