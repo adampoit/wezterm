@@ -43,7 +43,11 @@
   outputs =
     inputs@{ self, ... }:
     let
-      perSystemOutputs = inputs.flake-utils.lib.eachDefaultSystem (
+      perSystemOutputs = inputs.flake-utils.lib.eachSystem [
+        "aarch64-darwin"
+        "aarch64-linux"
+        "x86_64-linux"
+      ] (
         system:
         let
           overlays = [ (import inputs.rust-overlay) ];
