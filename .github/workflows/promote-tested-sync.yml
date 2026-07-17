@@ -1,0 +1,38 @@
+name: Promote Tested Sync Branch
+
+on:
+  workflow_run:
+    workflows: ["Fork CI"]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'sync/integration'
+    runs-on: ubuntu-latest
+    steps:
+      - id: not-adam
+        uses: adampoit/not-adam@v1
+        with:
+          private-key: ${{ secrets.NOT_ADAM_APP_PRIVATE_KEY }}
+
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.not-adam.outputs.token }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run patchlane promote
+        env:
+          GH_TOKEN: ${{ steps.not-adam.outputs.token }}
+          EXPECTED_SYNC_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: npx patchlane@0.4.0 promote
