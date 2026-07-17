@@ -1,0 +1,15 @@
+version: 1
+upstream: wezterm/wezterm
+source: branch:main
+baseBranch: main
+syncBranch: sync/integration
+patchRefs:
+  - patch/sync
+  - patch/fork-ci
+  - patch/local-dev
+  - patch/vim-copy-mode
+  - patch/font-thickening
+  - patch/gui-retarget-subscription
+  - patch/workspace-events
+  - patch/repaint-debug
+ciWorkflow: Fork CI
