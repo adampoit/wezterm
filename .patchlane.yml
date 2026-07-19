@@ -13,3 +13,5 @@ patchRefs:
   - patch/workspace-events
   - patch/repaint-debug
 ciWorkflow: Fork CI
+allowedWorkflows:
+  - fork-ci.yml
