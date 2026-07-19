@@ -6,7 +6,7 @@ on:
     types: [completed]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   promote:
@@ -35,4 +35,4 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.not-adam.outputs.token }}
           EXPECTED_SYNC_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: npx patchlane@0.4.0 promote
+        run: npx patchlane@0.5.1 promote
