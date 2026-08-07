@@ -1,5 +1,4 @@
 name: Sync Upstream Integration
-run-name: ${{ inputs.verification_id && format('Verify Patchlane authentication ({0})', inputs.verification_id) || 'Sync Upstream Integration' }}
 
 on:
   schedule:
@@ -18,11 +17,6 @@ on:
         default: ""
       patch_refs:
         description: Override the configured comma-separated patch branches.
-        type: string
-        required: false
-        default: ""
-      verification_id:
-        description: Correlate a Patchlane authentication check run.
         type: string
         required: false
         default: ""
@@ -56,4 +50,4 @@ jobs:
           UPSTREAM_SOURCE: ${{ inputs.source }}
           PATCH_REFS: ${{ inputs.patch_refs }}
           NO_PUSH: ${{ inputs.no_push || false }}
-        run: npx patchlane@0.5.1 sync
+        run: npx patchlane@0.5.3 sync
